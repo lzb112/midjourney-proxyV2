@@ -374,6 +374,7 @@ namespace Midjourney.API.Controllers
 
                 item.RunningCount = inc?.GetRunningFutures().Count ?? 0;
                 item.QueueCount = inc?.GetQueueTasks().Count ?? 0;
+                item.Running = inc?.IsAlive ?? false;
 
                 if (_isAnonymous)
                 {
@@ -452,6 +453,18 @@ namespace Midjourney.API.Controllers
             var task = DbHelper.TaskStore.Get(id);
             if (task != null)
             {
+                var ins = _loadBalancer.GetDiscordInstance(task.InstanceId);
+                if (ins != null)
+                {
+                    var model = ins.FindRunningTask(c => c.Id == id).FirstOrDefault();
+                    if (model != null)
+                    {
+                        model.Fail("删除任务");
+
+                        Thread.Sleep(1000);
+                    }
+                }
+
                 DbHelper.TaskStore.Delete(id);
             }
 

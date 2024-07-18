@@ -25,7 +25,6 @@ namespace Midjourney.Infrastructure
         /// </summary>
         /// <param name="discordHelper"></param>
         /// <param name="options"></param>
-        /// <param name="httpClient"></param>
         /// <param name="taskStoreService"></param>
         /// <param name="messageHandlers"></param>
         /// <param name="notifyService"></param>
@@ -96,7 +95,12 @@ namespace Midjourney.Infrastructure
                 var messageListener = new BotMessageListener(account, _discordHelper, webProxy);
 
                 // 用户 WebSocket 连接
-                var webSocket = new WebSocketStarter(account, _discordHelper, messageListener, webProxy, discordService);
+                var webSocket = new WebSocketManager(account,
+                    _discordHelper,
+                    messageListener, 
+                    webProxy,
+                    discordService,
+                    discordInstance);
 
                 await webSocket.StartAsync();
 
@@ -106,7 +110,7 @@ namespace Midjourney.Infrastructure
 
                 // 跟踪 wss 连接
                 discordInstance.BotMessageListener = messageListener;
-                discordInstance.WebSocketStarter = webSocket;
+                discordInstance.WebSocketManager = webSocket;
             }
 
             return discordInstance;

@@ -46,12 +46,10 @@
 		<Content Remove="Resources\ApiParams\imagineniji.json" />
 		<Content Remove="Resources\ApiParams\blendniji.json" />
 		<Content Remove="Resources\ApiParams\describeniji.json" />
+		<Content Remove="Resources\ApiParams\seedniji.json" />
 		<Content Remove="Resources\mime.types" />
 	</ItemGroup>
 
-	<ItemGroup>
-	  <None Remove="Resources\ApiParams\seedniji.json" />
-	</ItemGroup>
 
 	<ItemGroup>
 		<EmbeddedResource Include="Resources\ApiParams\blendniji.json" />
@@ -83,6 +81,4 @@
 	  </None>
 	</ItemGroup>
 
-	<ProjectExtensions><VisualStudio><UserProperties resources_4apiparams_4info_1json__JsonSchema="https://raw.githubusercontent.com/DannyBen/bashly/master/schemas/strings.json" /></VisualStudio></ProjectExtensions>
-	
 </Project>

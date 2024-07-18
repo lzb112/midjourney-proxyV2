@@ -82,7 +82,17 @@
 docker pull registry.cn-guangzhou.aliyuncs.com/trueai-org/midjourney-proxy
 
 # 公益演示站点启动配置示例
+
+# 1.下载并重命名配置文件（示例配置）
+wget -O /root/mjopen/appsettings.Production.json https://raw.githubusercontent.com/trueai-org/midjourney-proxy/main/src/Midjourney.API/appsettings.json
+
+# 或使用 curl 下载并重命名配置文件（示例配置）
+curl -o /root/mjopen/appsettings.Production.json https://raw.githubusercontent.com/trueai-org/midjourney-proxy/main/src/Midjourney.API/appsettings.json
+
+# 2.停止并移除旧的 Docker 容器
 docker stop mjopen && docker rm mjopen
+
+# 3.启动新的 Docker 容器
 docker run --name mjopen -d --restart=always \
  -e DEMO=true \
  -p 8086:8080 --user root \
@@ -257,7 +267,7 @@ https://discord.com/oauth2/authorize?client_id=xxx&permissions=8&scope=bot
 ## 支持与赞助
 
 - 如果觉得这个项目对您有所帮助，请帮忙点个 Star⭐
-- 您也可以提供暂时不用的绘画公益账号，支持此项目的发展😀
+- 您也可以提供暂时空闲的绘画公益账号（赞助慢速模式），支持此项目的发展😀
 
 ## 友情链接
 

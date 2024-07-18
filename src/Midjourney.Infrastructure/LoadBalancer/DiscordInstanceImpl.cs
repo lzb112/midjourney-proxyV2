@@ -77,7 +77,7 @@ namespace Midjourney.Infrastructure.LoadBalancer
         /// 判断实例是否存活
         /// </summary>
         /// <returns>是否存活</returns>
-        public bool IsAlive => _account.Enable;
+        public bool IsAlive => _account.Enable && WebSocketManager.Running;
 
         /// <summary>
         /// 获取正在运行的任务列表。
@@ -93,7 +93,7 @@ namespace Midjourney.Infrastructure.LoadBalancer
 
         public BotMessageListener BotMessageListener { get; set; }
 
-        public WebSocketStarter WebSocketStarter { get; set; }
+        public WebSocketManager WebSocketManager { get; set; }
 
         /// <summary>
         /// 后台服务执行任务
@@ -305,7 +305,7 @@ namespace Midjourney.Infrastructure.LoadBalancer
                 {
                     info.Fail(result.Description);
                     SaveAndNotify(info);
-                    _logger.Debug("[{AccountDisplay}] task finished, id: {TaskId}, status: {TaskStatus}", _account.GetDisplay(), info.Id, info.Status);
+                    _logger.Debug("[{@0}] task finished, id: {@1}, status: {@2}", _account.GetDisplay(), info.Id, info.Status);
                     return;
                 }
 
@@ -595,7 +595,7 @@ namespace Midjourney.Infrastructure.LoadBalancer
             try
             {
                 BotMessageListener?.Dispose();
-                WebSocketStarter?.Dispose();
+                WebSocketManager?.Dispose();
 
                 _mre.Set();
 
