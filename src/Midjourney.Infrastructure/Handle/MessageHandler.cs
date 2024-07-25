@@ -74,11 +74,25 @@ namespace Midjourney.Infrastructure.Handle
             }
 
             // 如果依然找不到任务，可能是 NIJI 任务
+            // 不判断 && botType == EBotType.NIJI_JOURNEY
             var botType = GetBotType(message);
-            if (task == null && botType == EBotType.NIJI_JOURNEY)
+            if (task == null)
             {
-                task = instance.FindRunningTask(c => c.BotType == botType && (c.PromptEn.RemoveWhitespace().EndsWith(finalPrompt.RemoveWhitespace()) || finalPrompt.RemoveWhitespace().StartsWith(c.PromptEn.RemoveWhitespace())))
-                    .OrderBy(c => c.StartTime).FirstOrDefault();
+                var prompt = finalPrompt.FormatPrompt();
+
+                if (!string.IsNullOrWhiteSpace(prompt))
+                {
+                    task = instance
+                        .FindRunningTask(c => c.BotType == botType && (c.PromptEn.FormatPrompt() == prompt || c.PromptEn.FormatPrompt().EndsWith(prompt) || prompt.StartsWith(c.PromptEn.FormatPrompt())))
+                        .OrderBy(c => c.StartTime).FirstOrDefault();
+                }
+                else
+                {
+                    // 如果最终提示词为空，则可能是重绘、混图等任务
+                    task = instance
+                        .FindRunningTask(c => c.BotType == botType && c.Action == action)
+                        .OrderBy(c => c.StartTime).FirstOrDefault();
+                }
             }
 
             if (task == null)

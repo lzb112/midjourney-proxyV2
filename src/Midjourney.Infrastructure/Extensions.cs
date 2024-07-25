@@ -21,17 +21,45 @@ namespace Midjourney.Infrastructure
         }
 
         /// <summary>
-        /// 移除空白字符
+        /// 移除空白字符、url 等，只保留参数的 prompt 用于比较
         /// </summary>
         /// <param name="str"></param>
         /// <returns></returns>
         /// <exception cref="ArgumentNullException"></exception>
-        public static string RemoveWhitespace(this string str)
+        public static string FormatPrompt(this string str)
         {
             if (str == null)
                 throw new ArgumentNullException(nameof(str));
 
-            return Regex.Replace(str, @"\s+", "");
+            // 移除 <url> , 例如: <https://www.baidu.com> a cute girl -> acutegirl
+            // 移除 url, 例如: https://www.baiud.com a cute girl -> acutegirl
+            // 移除空白字符, 例如: a cute girl -> acutegirl
+
+            // 修复 -> v6.0 问题
+            // Interactiveinstallations,textlayout,interestingshapes,children.--ar1:1--v6.0--iw2
+            // Interactiveinstallations,textlayout,interestingshapes,children.--ar1: 1--v6--iw2
+
+            str = GetPrimaryPrompt(str);
+
+            return Regex.Replace(str, @"<[^>]*>|https?://\S+|\s+", "").ToLower();
+        }
+
+        /// <summary>
+        /// 获取格式化之后的 prompt 用于比较
+        /// </summary>
+        /// <param name="prompt"></param>
+        /// <returns></returns>
+        private static string GetPrimaryPrompt(string prompt)
+        {
+            // 去除 -- 开头的参数
+            prompt = Regex.Replace(prompt, @"\x20+--[a-z]+.*$", string.Empty, RegexOptions.IgnoreCase);
+
+            // 匹配并替换 URL
+            string regex = @"https?://[-a-zA-Z0-9+&@#/%?=~_|!:,.;]*[-a-zA-Z0-9+&@#/%=~_|]";
+            prompt = Regex.Replace(prompt, regex, "<link>");
+
+            // 替换多余的 <<link>> 为 <link>
+            return prompt.Replace("<<link>>", "<link>");
         }
 
         /// <summary>
@@ -39,7 +67,6 @@ namespace Midjourney.Infrastructure
         /// 例如：由 E:\_backups\p00\3e4 -> _backups/p00/3e4
         /// </summary>
         /// <param name="path"></param>
-        /// <param name="removePrefix">移除的前缀</param>
         /// <returns></returns>
         public static string ToUrlPath(this string path)
         {

@@ -135,7 +135,7 @@ namespace Midjourney.Infrastructure
                 if (msg == null)
                     return;
 
-                _logger.Debug($"BOT Received, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, {msg.Content}");
+                _logger.Debug($"BOT Received, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, mid: {msg?.InteractionMetadata?.Id}, {msg.Content}");
 
                 if (!string.IsNullOrWhiteSpace(msg.Content)
                     && msg.Author.IsBot)
@@ -203,6 +203,8 @@ namespace Midjourney.Infrastructure
         {
             try
             {
+                _logger.Debug("用户收到消息 {@0}", raw.ToString());
+
                 if (!raw.TryGetProperty("t", out JsonElement messageTypeElement))
                 {
                     return;
@@ -370,14 +372,65 @@ namespace Midjourney.Infrastructure
                         {
                             foreach (JsonElement item in em.EnumerateArray())
                             {
-                                if (item.TryGetProperty("title", out var emtitle))
+                                if (item.TryGetProperty("title", out var emTitle))
                                 {
                                     // 判断账号是否用量已经用完
-                                    if (emtitle.GetString() == "Credits exhausted")
+                                    var title = emTitle.GetString();
+
+                                    // 16711680 error, 65280 success, 16776960 warning
+                                    var color = item.TryGetProperty("color", out var colorEle) ? colorEle.GetInt32() : 0;
+
+                                    // 无效参数、违规的提示词、无效提示词
+                                    var errorTitles = new[] {
+                                        "Invalid prompt", // 无效提示词
+                                        "Invalid parameter", // 无效参数
+                                        "Banned prompt detected", // 违规提示词
+                                        "Invalid link" // 无效链接
+                                    };
+
+                                    // 跳过的 title
+                                    var continueTitles = new[] {
+                                        "Job queued", // 执行中的队列已满
+                                        "Credits exhausted", // 余额不足
+                                        "Action needed to continue",
+                                        "Pending mod message", // 警告
+                                        "Blocked", // 警告
+                                        "Plan Cancelled", // 取消计划
+                                        "Subscription required" // 订阅过期
+                                    };
+
+                                    if (!continueTitles.Contains(title) && (errorTitles.Contains(title) || color == 16711680 || title.Contains("Invalid")))
+                                    {
+                                        if (data.TryGetProperty("nonce", out JsonElement noneEle))
+                                        {
+                                            var nonce = noneEle.GetString();
+                                            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(nonce))
+                                            {
+                                                // 设置 none 对应的任务 id
+                                                var task = _discordInstance.GetRunningTaskByNonce(nonce);
+                                                if (task != null)
+                                                {
+                                                    if (messageType == MessageType.CREATE)
+                                                    {
+                                                        task.MessageId = id;
+                                                        task.Description = $"{title}, {item.GetProperty("description").GetString()}";
+
+                                                        if (!task.MessageIds.Contains(id))
+                                                        {
+                                                            task.MessageIds.Add(id);
+                                                        }
+
+                                                        task.Fail(title);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // 用量用完了
+                                    else if (title == "Credits exhausted")
                                     {
                                         // 你的处理逻辑
-                                        _logger.Warning($"账号 {_discordAccount.GetDisplay()} 用量已经用完");
-                                        _discordAccount.Enable = false;
+                                        _logger.Warning($"账号 {_discordAccount.GetDisplay()} 用量已经用完, 自动禁用账号");
 
                                         var task = _discordInstance.FindRunningTask(c => c.MessageId == id).FirstOrDefault();
                                         if (task == null && !string.IsNullOrWhiteSpace(metaId))
@@ -390,9 +443,74 @@ namespace Midjourney.Infrastructure
                                             task.Fail("账号用量已经用完");
                                         }
 
+                                        // 5s 后禁用账号
+                                        Task.Run(() =>
+                                        {
+                                            try
+                                            {
+                                                Thread.Sleep(5 * 1000);
+
+                                                // 保存
+                                                _discordAccount.Enable = false;
+                                                _discordAccount.DisabledReason = "账号用量已经用完";
+
+                                                DbHelper.AccountStore.Save(_discordAccount);
+
+                                                _discordInstance?.Dispose();
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Log.Error(ex, "账号用量已经用完, 禁用账号异常 {@0}", _discordAccount.ChannelId);
+                                            }
+                                        });
+
                                         return;
                                     }
-                                    else if (emtitle.GetString() == "Invalid parameter")
+                                    // 临时禁止/订阅取消/订阅过期
+                                    else if (title == "Pending mod message"
+                                        || title == "Blocked"
+                                        || title == "Plan Cancelled"
+                                        || title == "Subscription required")
+                                    {
+                                        // 你的处理逻辑
+                                        _logger.Warning($"账号 {_discordAccount.GetDisplay()} {title}, 自动禁用账号");
+
+                                        var task = _discordInstance.FindRunningTask(c => c.MessageId == id).FirstOrDefault();
+                                        if (task == null && !string.IsNullOrWhiteSpace(metaId))
+                                        {
+                                            task = _discordInstance.FindRunningTask(c => c.InteractionMetadataId == metaId).FirstOrDefault();
+                                        }
+
+                                        if (task != null)
+                                        {
+                                            task.Fail(title);
+                                        }
+
+                                        // 5s 后禁用账号
+                                        Task.Run(() =>
+                                        {
+                                            try
+                                            {
+                                                Thread.Sleep(5 * 1000);
+
+                                                // 保存
+                                                _discordAccount.Enable = false;
+                                                _discordAccount.DisabledReason = title;
+
+                                                DbHelper.AccountStore.Save(_discordAccount);
+
+                                                _discordInstance?.Dispose();
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Log.Error(ex, "{@0}, 禁用账号异常 {@1}", title, _discordAccount.ChannelId);
+                                            }
+                                        });
+
+                                        return;
+                                    }
+                                    // 执行中的任务已满（一般超过 3 个时）
+                                    else if (title == "Job queued")
                                     {
                                         if (data.TryGetProperty("nonce", out JsonElement noneEle))
                                         {
@@ -406,72 +524,40 @@ namespace Midjourney.Infrastructure
                                                     if (messageType == MessageType.CREATE)
                                                     {
                                                         task.MessageId = id;
-                                                        task.Description = item.GetProperty("description").GetString();
+                                                        task.Description = $"{emTitle.GetString()}, {item.GetProperty("description").GetString()}";
 
                                                         if (!task.MessageIds.Contains(id))
                                                         {
                                                             task.MessageIds.Add(id);
                                                         }
-
-                                                        task.Fail($"无效参数");
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    else if (emtitle.GetString().Contains("Banned Prompt Detected"))
-                                    {
-                                        if (data.TryGetProperty("nonce", out JsonElement noneEle))
-                                        {
-                                            var nonce = noneEle.GetString();
-                                            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(nonce))
-                                            {
-                                                // 设置 none 对应的任务 id
-                                                var task = _discordInstance.GetRunningTaskByNonce(nonce);
-                                                if (task != null)
-                                                {
-                                                    if (messageType == MessageType.CREATE)
-                                                    {
-                                                        task.MessageId = id;
-                                                        task.Description = $"{emtitle.GetString()}, {item.GetProperty("description").GetString()}";
-
-                                                        if (!task.MessageIds.Contains(id))
-                                                        {
-                                                            task.MessageIds.Add(id);
-                                                        }
-
-                                                        task.Fail($"违规的提示词");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    // 未知消息
                                     else
                                     {
-                                        var title = emtitle.GetString();
-                                        if (!string.IsNullOrWhiteSpace(title))
+                                        if (data.TryGetProperty("nonce", out JsonElement noneEle))
                                         {
-                                            if (data.TryGetProperty("nonce", out JsonElement noneEle))
+                                            var nonce = noneEle.GetString();
+                                            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(nonce))
                                             {
-                                                var nonce = noneEle.GetString();
-                                                if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(nonce))
+                                                // 设置 none 对应的任务 id
+                                                var task = _discordInstance.GetRunningTaskByNonce(nonce);
+                                                if (task != null)
                                                 {
-                                                    // 设置 none 对应的任务 id
-                                                    var task = _discordInstance.GetRunningTaskByNonce(nonce);
-                                                    if (task != null)
+                                                    if (messageType == MessageType.CREATE)
                                                     {
-                                                        if (messageType == MessageType.CREATE)
+                                                        task.MessageId = id;
+                                                        task.Description = $"{title}, {item.GetProperty("description").GetString()}";
+
+                                                        if (!task.MessageIds.Contains(id))
                                                         {
-                                                            task.MessageId = id;
-                                                            task.Description = $"{title}, {item.GetProperty("description").GetString()}";
-
-                                                            if (!task.MessageIds.Contains(id))
-                                                            {
-                                                                task.MessageIds.Add(id);
-                                                            }
-
-                                                            Log.Warning($"未知消息: {title}, {item.GetProperty("description").GetString()}, {_discordAccount.ChannelId}");
+                                                            task.MessageIds.Add(id);
                                                         }
+
+                                                        _logger.Warning($"未知消息: {title}, {item.GetProperty("description").GetString()}, {_discordAccount.ChannelId}");
                                                     }
                                                 }
                                             }
