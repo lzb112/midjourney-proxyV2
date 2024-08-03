@@ -1,5 +1,4 @@
 ﻿using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.TagHelpers.Cache;
 using Microsoft.Extensions.Options;
 using Midjourney.Infrastructure.Dto;
 using Midjourney.Infrastructure.Services;
@@ -15,27 +14,51 @@ namespace Midjourney.API.Controllers
     /// </summary>
     [ApiController]
     [Route("mj/submit")]
+    [Route("mj-fast/mj/submit")]
+    [Route("mj-turbo/mj/submit")]
+    [Route("mj-relax/mj/submit")]
     public class SubmitController : ControllerBase
     {
         private readonly ITranslateService _translateService;
         private readonly ITaskStoreService _taskStoreService;
 
+        private readonly DiscordHelper _discordHelper;
         private readonly ProxyProperties _properties;
         private readonly ITaskService _taskService;
         private readonly ILogger<SubmitController> _logger;
+        private readonly string _ip;
+
+        private readonly GenerationSpeedMode? _mode;
 
         public SubmitController(
             ITranslateService translateService,
             ITaskStoreService taskStoreService,
             IOptionsSnapshot<ProxyProperties> properties,
             ITaskService taskService,
-            ILogger<SubmitController> logger)
+            ILogger<SubmitController> logger,
+            IHttpContextAccessor httpContextAccessor,
+            DiscordHelper discordHelper)
         {
             _translateService = translateService;
             _taskStoreService = taskStoreService;
             _properties = properties.Value;
             _taskService = taskService;
             _logger = logger;
+            _discordHelper = discordHelper;
+
+            _ip = httpContextAccessor.HttpContext.Request.GetIP();
+
+            var mode = httpContextAccessor.HttpContext.Items["Mode"]?.ToString();
+            if (!string.IsNullOrWhiteSpace(mode))
+            {
+                _mode = mode switch
+                {
+                    "turbo" => GenerationSpeedMode.TURBO,
+                    "relax" => GenerationSpeedMode.RELAX,
+                    "fast" => GenerationSpeedMode.FAST,
+                    _ => null
+                };
+            }
         }
 
         /// <summary>
@@ -84,8 +107,59 @@ namespace Midjourney.API.Controllers
             task.BotType = GetBotType(imagineDTO.BotType);
             task.PromptEn = promptEn;
             task.Description = $"/imagine {prompt}";
+            task.AccountFilter = imagineDTO.AccountFilter;
 
             var data = _taskService.SubmitImagine(task, dataUrls);
+            return Ok(data);
+        }
+
+        /// <summary>
+        /// 提交 show 任务
+        /// </summary>
+        /// <param name="imagineDTO"></param>
+        /// <returns></returns>
+        [HttpPost("show")]
+        public ActionResult<SubmitResultVO> Show([FromBody] SubmitShowDTO imagineDTO)
+        {
+            string jobId = imagineDTO.JobId;
+            if (string.IsNullOrWhiteSpace(jobId))
+            {
+                return BadRequest(SubmitResultVO.Fail(ReturnCode.VALIDATION_ERROR, "请填写 job id 或 url"));
+            }
+            jobId = jobId.Trim();
+
+            if (jobId.Length != 36)
+            {
+                jobId = _discordHelper.GetMessageHash(jobId);
+            }
+
+            if (string.IsNullOrWhiteSpace(jobId))
+            {
+                return BadRequest(SubmitResultVO.Fail(ReturnCode.VALIDATION_ERROR, "job id 格式错误"));
+            }
+
+            var model = DbHelper.TaskStore.GetCollection().Query().Where(c => c.JobId == jobId && c.Status == TaskStatus.SUCCESS).FirstOrDefault();
+            if (model != null)
+            {
+                var info = SubmitResultVO.Of(ReturnCode.SUCCESS, "提交成功", model.Id)
+                    .SetProperty(Constants.TASK_PROPERTY_DISCORD_INSTANCE_ID, model.InstanceId);
+                return Ok(info);
+            }
+
+            if (string.IsNullOrWhiteSpace(imagineDTO.AccountFilter?.InstanceId))
+            {
+                return BadRequest(SubmitResultVO.Fail(ReturnCode.VALIDATION_ERROR, "show 命令必须指定实例"));
+            }
+
+            var task = NewTask(imagineDTO);
+
+            task.Action = TaskAction.SHOW;
+            task.BotType = GetBotType(imagineDTO.BotType);
+            task.Description = $"/show {jobId}";
+            task.AccountFilter = imagineDTO.AccountFilter;
+            task.JobId = jobId;
+
+            var data = _taskService.ShowImagine(task);
             return Ok(data);
         }
 
@@ -155,6 +229,7 @@ namespace Midjourney.API.Controllers
 
             task.Action = changeDTO.Action;
             task.BotType = targetTask.BotType;
+            task.ParentId = targetTask.Id;
             task.Prompt = targetTask.Prompt;
             task.PromptEn = targetTask.PromptEn;
 
@@ -212,6 +287,8 @@ namespace Midjourney.API.Controllers
 
             string taskFileName = $"{task.Id}.{MimeTypeUtils.GuessFileSuffix(dataUrl.MimeType)}";
             task.Description = $"/describe {taskFileName}";
+            task.AccountFilter = describeDTO.AccountFilter;
+
             return Ok(_taskService.SubmitDescribe(task, dataUrl));
         }
 
@@ -250,6 +327,7 @@ namespace Midjourney.API.Controllers
             task.BotType = GetBotType(blendDTO.BotType);
             task.Action = TaskAction.BLEND;
             task.Description = $"/blend {task.Id} {dataUrlList.Count}";
+            task.AccountFilter = blendDTO.AccountFilter;
             return Ok(_taskService.SubmitBlend(task, dataUrlList, blendDTO.Dimensions.Value));
         }
 
@@ -280,6 +358,7 @@ namespace Midjourney.API.Controllers
 
             var task = NewTask(actionDTO);
             task.InstanceId = targetTask.InstanceId;
+            task.ParentId = targetTask.Id;
             task.BotType = targetTask.BotType;
 
             // 识别 mj action
@@ -289,6 +368,9 @@ namespace Midjourney.API.Controllers
             if (actionDTO.CustomId.StartsWith("MJ::JOB::upsample::"))
             {
                 task.Action = TaskAction.UPSCALE;
+
+                // 在进行 U 时，记录目标图片的 U 的 customId
+                task.SetProperty(Constants.TASK_PROPERTY_REMIX_U_CUSTOM_ID, actionDTO.CustomId);
             }
             // 微调
             // MJ::JOB::variation::2::898416ec-7c18-4762-bf03-8e428fee1860
@@ -345,6 +427,12 @@ namespace Midjourney.API.Controllers
             else if (actionDTO.CustomId.StartsWith("MJ::Inpaint::"))
             {
                 task.Action = TaskAction.INPAINT;
+            }
+            // describe 重新提交
+            else if (actionDTO.CustomId.Contains("MJ::Picread::Retry"))
+            {
+                task.ImageUrl = targetTask.ImageUrl;
+                task.Action = TaskAction.DESCRIBE;
             }
             else
             {
@@ -422,8 +510,20 @@ namespace Midjourney.API.Controllers
                 Id = $"{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}{RandomUtils.RandomNumbers(3)}",
                 SubmitTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 State = baseDTO.State,
-                Status = TaskStatus.NOT_START
+                Status = TaskStatus.NOT_START,
+                ClientIp = _ip,
+                Mode = _mode
             };
+
+            if (_mode != null)
+            {
+                task.AccountFilter ??= new AccountFilter();
+
+                if (!task.AccountFilter.Modes.Contains(_mode.Value))
+                {
+                    task.AccountFilter.Modes.Add(_mode.Value);
+                }
+            }
 
             var notifyHook = string.IsNullOrWhiteSpace(baseDTO.NotifyHook) ? _properties.NotifyHook : baseDTO.NotifyHook;
             task.SetProperty(Constants.TASK_PROPERTY_NOTIFY_HOOK, notifyHook);

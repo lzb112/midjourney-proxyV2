@@ -16,30 +16,25 @@ namespace Midjourney.Infrastructure
         private readonly DiscordHelper _discordHelper;
         private readonly ProxyProperties _properties;
         private readonly ITaskStoreService _taskStoreService;
-        private readonly IEnumerable<MessageHandler> _messageHandlers;
+        private readonly IEnumerable<BotMessageHandler> _botMessageHandlers;
+        private readonly IEnumerable<UserMessageHandler> _userMessageHandlers;
         private readonly Dictionary<string, string> _paramsMap;
         private readonly INotifyService _notifyService;
 
-        /// <summary>
-        /// 初始化 DiscordAccountHelper 类的新实例。
-        /// </summary>
-        /// <param name="discordHelper"></param>
-        /// <param name="options"></param>
-        /// <param name="taskStoreService"></param>
-        /// <param name="messageHandlers"></param>
-        /// <param name="notifyService"></param>
         public DiscordAccountHelper(
             DiscordHelper discordHelper,
             IOptionsMonitor<ProxyProperties> options,
             ITaskStoreService taskStoreService,
-            IEnumerable<MessageHandler> messageHandlers,
-            INotifyService notifyService)
+            IEnumerable<BotMessageHandler> messageHandlers,
+            INotifyService notifyService,
+            IEnumerable<UserMessageHandler> userMessageHandlers)
         {
             _discordHelper = discordHelper;
             _properties = options.CurrentValue;
             _taskStoreService = taskStoreService;
             _notifyService = notifyService;
-            _messageHandlers = messageHandlers;
+            _botMessageHandlers = messageHandlers;
+            _userMessageHandlers = userMessageHandlers;
 
             var paramsMap = new Dictionary<string, string>();
             var assembly = Assembly.GetExecutingAssembly();
@@ -81,30 +76,35 @@ namespace Midjourney.Infrastructure
                 account.UserAgent = Constants.DEFAULT_DISCORD_USER_AGENT;
             }
 
-            var discordService = new DiscordServiceImpl(account, _discordHelper, _paramsMap);
-            var discordInstance = new DiscordInstanceImpl(account, discordService, _taskStoreService, _notifyService);
+            // Bot 消息监听器
+            WebProxy webProxy = null;
+            if (!string.IsNullOrEmpty(_properties.Proxy?.Host))
+            {
+                webProxy = new WebProxy(_properties.Proxy.Host, _properties.Proxy.Port ?? 80);
+            }
+
+            var discordInstance = new DiscordInstance(account,
+                _taskStoreService,
+                _notifyService,
+                _discordHelper,
+                _paramsMap,
+                webProxy);
 
             if (account.Enable)
             {
-                // Bot 消息监听器
-                WebProxy webProxy = null;
-                if (!string.IsNullOrEmpty(_properties.Proxy?.Host))
-                {
-                    webProxy = new WebProxy(_properties.Proxy.Host, _properties.Proxy.Port ?? 80);
-                }
-                var messageListener = new BotMessageListener(account, _discordHelper, webProxy);
+              
+                var messageListener = new BotMessageListener(_discordHelper, _properties, webProxy);
 
                 // 用户 WebSocket 连接
-                var webSocket = new WebSocketManager(account,
+                var webSocket = new WebSocketManager(
                     _discordHelper,
-                    messageListener, 
+                    messageListener,
                     webProxy,
-                    discordService,
                     discordInstance);
 
                 await webSocket.StartAsync();
 
-                messageListener.Init(discordInstance, _messageHandlers);
+                messageListener.Init(discordInstance, _botMessageHandlers, _userMessageHandlers);
 
                 await messageListener.StartAsync();
 

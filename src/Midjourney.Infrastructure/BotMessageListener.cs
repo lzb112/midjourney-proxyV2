@@ -7,10 +7,14 @@ using Midjourney.Infrastructure.Domain;
 using Midjourney.Infrastructure.Dto;
 using Midjourney.Infrastructure.Handle;
 using Midjourney.Infrastructure.LoadBalancer;
+using Midjourney.Infrastructure.Util;
+using RestSharp;
 using Serilog;
 using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+
+using EventData = Midjourney.Infrastructure.Dto.EventData;
 
 namespace Midjourney.Infrastructure
 {
@@ -19,29 +23,37 @@ namespace Midjourney.Infrastructure
     /// </summary>
     public class BotMessageListener : IDisposable
     {
-        private readonly WebProxy _webProxy;
-        private readonly DiscordAccount _discordAccount;
-        private readonly DiscordHelper _discordHelper;
         private readonly ILogger _logger = Log.Logger;
 
-        private DiscordInstanceImpl _discordInstance;
-        private IEnumerable<MessageHandler> _messageHandlers;
+        private readonly WebProxy _webProxy;
+        private readonly DiscordHelper _discordHelper;
+        private readonly ProxyProperties _properties;
+
+        private DiscordInstance _discordInstance;
+        private IEnumerable<BotMessageHandler> _botMessageHandlers;
+        private IEnumerable<UserMessageHandler> _userMessageHandlers;
 
         public BotMessageListener(
-            DiscordAccount discordAccount,
             DiscordHelper discordHelper,
+            ProxyProperties properties,
             WebProxy webProxy = null)
         {
-            _discordAccount = discordAccount;
+            _properties = properties;
             _webProxy = webProxy;
             _discordHelper = discordHelper;
         }
 
-        public void Init(DiscordInstanceImpl instance, IEnumerable<MessageHandler> messageHandlers)
+        public void Init(
+            DiscordInstance instance,
+            IEnumerable<BotMessageHandler> botMessageHandlers,
+            IEnumerable<UserMessageHandler> userMessageHandlers)
         {
             _discordInstance = instance;
-            _messageHandlers = messageHandlers;
+            _botMessageHandlers = botMessageHandlers;
+            _userMessageHandlers = userMessageHandlers;
         }
+
+        private DiscordAccount Account => _discordInstance?.Account;
 
         public async Task StartAsync()
         {
@@ -55,7 +67,8 @@ namespace Midjourney.Infrastructure
                 // you must set the MessageCacheSize. You may adjust the number as needed.
                 //MessageCacheSize = 50,
 
-                RestClientProvider = DefaultRestClientProvider.Create(true),
+                RestClientProvider = _webProxy != null ? CustomRestClientProvider.Create(_webProxy, true)
+                : DefaultRestClientProvider.Create(true),
                 WebSocketProvider = DefaultWebSocketProvider.Create(_webProxy),
 
                 // 读取消息权限 GatewayIntents.MessageContent
@@ -77,7 +90,7 @@ namespace Midjourney.Infrastructure
             _client.Log += LogAction;
             _commands.Log += LogAction;
 
-            await _client.LoginAsync(TokenType.Bot, _discordAccount.BotToken);
+            await _client.LoginAsync(TokenType.Bot, Account.BotToken);
             await _client.StartAsync();
 
             // Centralize the logic for commands into a separate method.
@@ -135,14 +148,28 @@ namespace Midjourney.Infrastructure
                 if (msg == null)
                     return;
 
-                _logger.Debug($"BOT Received, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, mid: {msg?.InteractionMetadata?.Id}, {msg.Content}");
+                _logger.Information($"BOT Received, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, mid: {msg?.InteractionMetadata?.Id}, {msg.Content}");
 
-                if (!string.IsNullOrWhiteSpace(msg.Content)
-                    && msg.Author.IsBot)
+                if (!string.IsNullOrWhiteSpace(msg.Content) && msg.Author.IsBot)
                 {
-                    foreach (var handler in _messageHandlers.OrderBy(h => h.Order()))
+                    foreach (var handler in _botMessageHandlers.OrderBy(h => h.Order()))
                     {
-                        handler.Handle(_discordInstance, MessageType.CREATE, msg);
+                        // 消息加锁处理
+                        LocalLock.TryLock($"lock_{msg.Id}", TimeSpan.FromSeconds(10), () =>
+                        {
+                            handler.Handle(_discordInstance, MessageType.CREATE, msg);
+                        });
+                    }
+                }
+                // describe 重新提交
+                // MJ::Picread::Retry
+                else if (msg.Embeds.Count > 0 && msg.Author.IsBot && msg.Components.Count > 0 && msg.Components.First().Components.Any(x => x.CustomId.Contains("PicReader")))
+                {
+                    var em = msg.Embeds.FirstOrDefault();
+                    if (em != null && !string.IsNullOrWhiteSpace(em.Description))
+                    {
+                        var handler = _botMessageHandlers.FirstOrDefault(x => x.GetType() == typeof(BotDescribeSuccessHandler));
+                        handler?.Handle(_discordInstance, MessageType.CREATE, msg);
                     }
                 }
             }
@@ -169,20 +196,20 @@ namespace Midjourney.Infrastructure
                 if (msg == null)
                     return;
 
-                _logger.Debug($"BOT Updated, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, {msg.Content}");
+                _logger.Information($"BOT Updated, {msg.Type}, id: {msg.Id}, rid: {msg.Reference?.MessageId.Value}, {msg.Content}");
 
                 if (!string.IsNullOrWhiteSpace(msg.Content)
                     && msg.Content.Contains("%")
                     && msg.Author.IsBot)
                 {
-                    foreach (var handler in _messageHandlers.OrderBy(h => h.Order()))
+                    foreach (var handler in _botMessageHandlers.OrderBy(h => h.Order()))
                     {
                         handler.Handle(_discordInstance, MessageType.UPDATE, after);
                     }
                 }
                 else if (msg.InteractionMetadata is ApplicationCommandInteractionMetadata metadata && metadata.Name == "describe")
                 {
-                    var handler = _messageHandlers.FirstOrDefault(x => x.GetType() == typeof(DescribeSuccessHandler));
+                    var handler = _botMessageHandlers.FirstOrDefault(x => x.GetType() == typeof(BotDescribeSuccessHandler));
                     handler?.Handle(_discordInstance, MessageType.CREATE, after);
                 }
 
@@ -193,7 +220,6 @@ namespace Midjourney.Infrastructure
                 Log.Error(ex, "处理 bot 更新消息异常");
             }
         }
-
 
         /// <summary>
         /// 处理接收到用户 ws 消息
@@ -221,6 +247,140 @@ namespace Midjourney.Infrastructure
                     return;
                 }
 
+                // 触发 CF 真人验证
+                if (messageType == MessageType.INTERACTION_IFRAME_MODAL_CREATE)
+                {
+                    if (data.TryGetProperty("title", out var t))
+                    {
+                        if (t.GetString() == "Action required to continue")
+                        {
+                            _logger.Warning("CF 验证 {@0}, {@1}", Account.ChannelId, raw.ToString());
+
+                            // 全局锁定中
+                            // 等待人工处理或者自动处理
+                            // 重试最多 3 次，最多处理 5 分钟
+                            LocalLock.TryLock($"cf_{Account.ChannelId}", TimeSpan.FromSeconds(10), () =>
+                            {
+                                try
+                                {
+                                    var custom_id = data.TryGetProperty("custom_id", out var c) ? c.GetString() : string.Empty;
+                                    var application_id = data.TryGetProperty("application", out var a) && a.TryGetProperty("id", out var id) ? id.GetString() : string.Empty;
+                                    if (!string.IsNullOrWhiteSpace(custom_id) && !string.IsNullOrWhiteSpace(application_id))
+                                    {
+                                        Account.Lock = true;
+
+                                        // MJ::iframe::U3NmeM-lDTrmTCN_QY5n4DXvjrQRPGOZrQiLa-fT9y3siLA2AGjhj37IjzCqCtVzthUhGBj4KKqNSntQ
+                                        var hash = custom_id.Split("::").LastOrDefault();
+                                        var hashUrl = $"https://{application_id}.discordsays.com/captcha/api/c/{hash}/ack?hash=1";
+
+                                        // 验证中，处于锁定模式
+                                        Account.DisabledReason = "CF 自动验证中...";
+                                        Account.CfHashUrl = hashUrl;
+                                        Account.CfHashCreated = DateTime.Now;
+
+                                        DbHelper.AccountStore.Save(Account);
+                                        _discordInstance.ClearAccountCache(Account.Id);
+
+                                        try
+                                        {
+                                            // 通知验证服务器
+                                            if (!string.IsNullOrWhiteSpace(_properties.CaptchaNotifyHook) && !string.IsNullOrWhiteSpace(_properties.CaptchaServer))
+                                            {
+                                                // 使用 restsharp 通知，最多 3 次
+                                                var notifyCount = 0;
+                                                do
+                                                {
+                                                    if (notifyCount > 3)
+                                                    {
+                                                        break;
+                                                    }
+
+                                                    notifyCount++;
+                                                    var notifyUrl = $"{_properties.CaptchaServer.Trim().TrimEnd('/')}/cf/verify";
+                                                    var client = new RestClient();
+                                                    var request = new RestRequest(notifyUrl, Method.Post);
+                                                    request.AddHeader("Content-Type", "application/json");
+                                                    var body = new CaptchaVerfyRequest
+                                                    {
+                                                        Url = hashUrl,
+                                                        State = Account.ChannelId,
+                                                        NotifyHook = _properties.CaptchaNotifyHook
+                                                    };
+                                                    var json = Newtonsoft.Json.JsonConvert.SerializeObject(body);
+                                                    request.AddJsonBody(json);
+                                                    var response = client.Execute(request);
+                                                    if (response.StatusCode == System.Net.HttpStatusCode.OK)
+                                                    {
+                                                        // 已通知自动验证服务器
+                                                        _logger.Information("CF 验证，已通知服务器 {@0}, {@1}", Account.ChannelId, hashUrl);
+
+                                                        break;
+                                                    }
+
+                                                    Thread.Sleep(1000);
+                                                } while (true);
+
+                                                // 发送邮件
+                                                EmailJob.Instance.EmailSend(_properties.Smtp, $"CF自动真人验证-{Account.ChannelId}", hashUrl);
+                                            }
+                                            else
+                                            {
+                                                // 发送 hashUrl GET 请求, 返回 {"hash":"OOUxejO94EQNxsCODRVPbg","token":"dXDm-gSb4Zlsx-PCkNVyhQ"}
+                                                // 通过 hash 和 token 拼接验证 CF 验证 URL
+
+                                                var httpClient = new HttpClient();
+                                                var response = httpClient.GetAsync(hashUrl).Result;
+                                                var con = response.Content.ReadAsStringAsync().Result;
+                                                if (!string.IsNullOrWhiteSpace(con))
+                                                {
+                                                    // 解析
+                                                    var json = JsonSerializer.Deserialize<JsonElement>(con);
+                                                    if (json.TryGetProperty("hash", out var h) && json.TryGetProperty("token", out var to))
+                                                    {
+                                                        var hashStr = h.GetString();
+                                                        var token = to.GetString();
+
+                                                        if (!string.IsNullOrWhiteSpace(hashStr) && !string.IsNullOrWhiteSpace(token))
+                                                        {
+                                                            // 发送验证 URL
+                                                            // 通过 hash 和 token 拼接验证 CF 验证 URL
+                                                            // https://editor.midjourney.com/captcha/challenge/index.html?hash=OOUxejO94EQNxsCODRVPbg&token=dXDm-gSb4Zlsx-PCkNVyhQ
+
+                                                            var url = $"https://editor.midjourney.com/captcha/challenge/index.html?hash={hashStr}&token={token}";
+
+                                                            _logger.Information($"{Account.ChannelId}, CF 真人验证 URL: {url}");
+
+                                                            Account.CfUrl = url;
+
+                                                            // 发送邮件
+                                                            EmailJob.Instance.EmailSend(_properties.Smtp, $"CF手动真人验证-{Account.ChannelId}", url);
+                                                        }
+                                                    }
+                                                }
+
+                                                Account.DisabledReason = "CF 人工验证...";
+
+                                                DbHelper.AccountStore.Save(Account);
+                                                _discordInstance.ClearAccountCache(Account.Id);
+                                            }
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            _logger.Error(ex, "CF 真人验证处理失败 {@0}", Account.ChannelId);
+                                        }
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    _logger.Error(ex, "CF 真人验证处理异常 {@0}", Account.ChannelId);
+                                }
+                            });
+
+                            return;
+                        }
+                    }
+                }
+
                 // 内容
                 var contentStr = string.Empty;
                 if (data.TryGetProperty("content", out JsonElement content))
@@ -228,31 +388,149 @@ namespace Midjourney.Infrastructure
                     contentStr = content.GetString();
                 }
 
+                // 作者
+                var authorName = string.Empty;
+                var authId = string.Empty;
+                if (data.TryGetProperty("author", out JsonElement author)
+                    && author.TryGetProperty("username", out JsonElement username)
+                    && author.TryGetProperty("id", out JsonElement uid))
+                {
+                    authorName = username.GetString();
+                    authId = uid.GetString();
+                }
+
+                // 应用 ID 即机器人 ID
+                var applicationId = string.Empty;
+                if (data.TryGetProperty("application_id", out JsonElement application))
+                {
+                    applicationId = application.GetString();
+                }
+
+                // 交互元数据 id
+                var metaId = string.Empty;
+                var metaName = string.Empty;
+                if (data.TryGetProperty("interaction_metadata", out JsonElement meta) && meta.TryGetProperty("id", out var m))
+                {
+                    metaId = m.GetString();
+
+                    metaName = meta.TryGetProperty("name", out var n) ? n.GetString() : string.Empty;
+                }
+
+                // 处理 remix 开关
+                if (metaName == "prefer remix" && !string.IsNullOrWhiteSpace(contentStr))
+                {
+                    // MJ
+                    if (authId == Constants.MJ_APPLICATION_ID)
+                    {
+                        if (contentStr.StartsWith("Remix mode turned off"))
+                        {
+                            foreach (var item in Account.Components)
+                            {
+                                foreach (var sub in item.Components)
+                                {
+                                    if (sub.Label == "Remix mode")
+                                    {
+                                        sub.Style = 2;
+                                    }
+                                }
+                            }
+                        }
+                        else if (contentStr.StartsWith("Remix mode turned on"))
+                        {
+                            foreach (var item in Account.Components)
+                            {
+                                foreach (var sub in item.Components)
+                                {
+                                    if (sub.Label == "Remix mode")
+                                    {
+                                        sub.Style = 3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // NIJI
+                    else if (authId == Constants.NIJI_APPLICATION_ID)
+                    {
+                        if (contentStr.StartsWith("Remix mode turned off"))
+                        {
+                            foreach (var item in Account.NijiComponents)
+                            {
+                                foreach (var sub in item.Components)
+                                {
+                                    if (sub.Label == "Remix mode")
+                                    {
+                                        sub.Style = 2;
+                                    }
+                                }
+                            }
+                        }
+                        else if (contentStr.StartsWith("Remix mode turned on"))
+                        {
+                            foreach (var item in Account.NijiComponents)
+                            {
+                                foreach (var sub in item.Components)
+                                {
+                                    if (sub.Label == "Remix mode")
+                                    {
+                                        sub.Style = 3;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    DbHelper.AccountStore.Save(Account);
+                    _discordInstance.ClearAccountCache(Account.Id);
+
+                    return;
+                }
+                // 同步 settings 和 remix
+                else if (metaName == "settings")
+                {
+                    // settings 指令
+                    var eventData = data.Deserialize<EventData>();
+                    if (eventData != null && eventData.InteractionMetadata?.Name == "settings" && eventData.Components?.Count > 0)
+                    {
+                        if (applicationId == Constants.NIJI_APPLICATION_ID)
+                        {
+                            Account.NijiComponents = eventData.Components;
+                            DbHelper.AccountStore.Update(Account);
+                            _discordInstance.ClearAccountCache(Account.Id);
+                        }
+                        else if (applicationId == Constants.MJ_APPLICATION_ID)
+                        {
+                            Account.Components = eventData.Components;
+                            DbHelper.AccountStore.Update(Account);
+                            _discordInstance.ClearAccountCache(Account.Id);
+                        }
+                    }
+                }
+
                 // 私信频道
                 var isPrivareChannel = false;
                 if (data.TryGetProperty("channel_id", out JsonElement channelIdElement))
                 {
-                    if (channelIdElement.GetString() == _discordAccount.PrivateChannelId
-                        || channelIdElement.GetString() == _discordAccount.NijiBotChannelId)
+                    if (channelIdElement.GetString() == Account.PrivateChannelId
+                        || channelIdElement.GetString() == Account.NijiBotChannelId)
                     {
                         isPrivareChannel = true;
                     }
 
-                    if (channelIdElement.GetString() == _discordAccount.ChannelId)
+                    if (channelIdElement.GetString() == Account.ChannelId)
                     {
                         isPrivareChannel = false;
                     }
 
                     // 都不相同
                     // 如果有渠道 id，但不是当前渠道 id，则忽略
-                    if (channelIdElement.GetString() != _discordAccount.ChannelId
-                        && channelIdElement.GetString() != _discordAccount.PrivateChannelId
-                        && channelIdElement.GetString() != _discordAccount.NijiBotChannelId)
+                    if (channelIdElement.GetString() != Account.ChannelId
+                        && channelIdElement.GetString() != Account.PrivateChannelId
+                        && channelIdElement.GetString() != Account.NijiBotChannelId)
                     {
                         return;
                     }
                 }
-
 
                 if (isPrivareChannel)
                 {
@@ -331,38 +609,13 @@ namespace Midjourney.Infrastructure
                     return;
                 }
 
-
-                // 作者
-                var authorName = string.Empty;
-                if (data.TryGetProperty("author", out JsonElement author)
-                    && author.TryGetProperty("username", out JsonElement username))
-                {
-                    authorName = username.GetString();
-                }
-
-                // 应用 ID 即机器人 ID
-                var applicationId = string.Empty;
-                if (data.TryGetProperty("application_id", out JsonElement application))
-                {
-                    applicationId = application.GetString();
-                }
-
-                // 交互元数据 id
-                var metaId = string.Empty;
-                var metaName = string.Empty;
-                if (data.TryGetProperty("interaction_metadata", out JsonElement meta) && meta.TryGetProperty("id", out var m))
-                {
-                    metaId = m.GetString();
-
-                    metaName = meta.TryGetProperty("name", out var n) ? n.GetString() : string.Empty;
-                }
-
                 // 任务 id
                 // 任务 nonce
                 if (data.TryGetProperty("id", out JsonElement idElement))
                 {
                     var id = idElement.GetString();
-                    _logger.Debug($"用户消息, {messageType}, {_discordAccount.GetDisplay()} - {authorName}: {contentStr}, id: {id}, mid: {metaId}");
+
+                    _logger.Information($"用户消息, {messageType}, {Account.GetDisplay()} - id: {id}, mid: {metaId}, {authorName}, content: {contentStr}");
 
                     var isEm = data.TryGetProperty("embeds", out var em);
                     if (messageType == MessageType.CREATE && isEm)
@@ -385,12 +638,14 @@ namespace Midjourney.Infrastructure
                                         "Invalid prompt", // 无效提示词
                                         "Invalid parameter", // 无效参数
                                         "Banned prompt detected", // 违规提示词
-                                        "Invalid link" // 无效链接
+                                        "Invalid link", // 无效链接
+                                        "Request cancelled due to output filters",
+                                        "Queue full", // 执行中的队列已满
                                     };
 
                                     // 跳过的 title
                                     var continueTitles = new[] {
-                                        "Job queued", // 执行中的队列已满
+                                        "Job queued", // 已加入到队列
                                         "Credits exhausted", // 余额不足
                                         "Action needed to continue",
                                         "Pending mod message", // 警告
@@ -425,12 +680,45 @@ namespace Midjourney.Infrastructure
                                                 }
                                             }
                                         }
+                                        else
+                                        {
+                                            // 如果没有获取到 none
+                                            _logger.Error("未知错误 {@0}, {@1}", Account.ChannelId, data.ToString());
+
+                                            // 如果 meta 是 show
+                                            // 说明是 show 任务出错了
+                                            if (metaName == "show")
+                                            {
+                                                var desc = item.GetProperty("description").GetString();
+                                                if (!string.IsNullOrWhiteSpace(desc))
+                                                {
+                                                    // 设置 none 对应的任务 id
+                                                    var task = _discordInstance.GetRunningTasks().Where(c => c.Action == TaskAction.SHOW && desc.Contains(c.JobId)).FirstOrDefault();
+                                                    if (task != null)
+                                                    {
+                                                        if (messageType == MessageType.CREATE)
+                                                        {
+                                                            task.MessageId = id;
+                                                            task.Description = $"{title}, {item.GetProperty("description").GetString()}";
+
+                                                            if (!task.MessageIds.Contains(id))
+                                                            {
+                                                                task.MessageIds.Add(id);
+                                                            }
+
+                                                            task.Fail(title);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
-                                    // 用量用完了
+                                    // fast 用量已经使用完了
+                                    // TODO 可以改为慢速模式
                                     else if (title == "Credits exhausted")
                                     {
                                         // 你的处理逻辑
-                                        _logger.Warning($"账号 {_discordAccount.GetDisplay()} 用量已经用完, 自动禁用账号");
+                                        _logger.Warning($"账号 {Account.GetDisplay()} 用量已经用完, 自动禁用账号");
 
                                         var task = _discordInstance.FindRunningTask(c => c.MessageId == id).FirstOrDefault();
                                         if (task == null && !string.IsNullOrWhiteSpace(metaId))
@@ -451,16 +739,21 @@ namespace Midjourney.Infrastructure
                                                 Thread.Sleep(5 * 1000);
 
                                                 // 保存
-                                                _discordAccount.Enable = false;
-                                                _discordAccount.DisabledReason = "账号用量已经用完";
+                                                Account.Enable = false;
+                                                Account.DisabledReason = "账号用量已经用完";
 
-                                                DbHelper.AccountStore.Save(_discordAccount);
-
+                                                DbHelper.AccountStore.Save(Account);
+                                                _discordInstance?.ClearAccountCache(Account.Id);
                                                 _discordInstance?.Dispose();
+
+
+                                                // 发送邮件
+                                                EmailJob.Instance.EmailSend(_properties.Smtp, $"MJ账号禁用通知-{Account.ChannelId}",
+                                                    $"{Account.ChannelId}, {Account.DisabledReason}");
                                             }
                                             catch (Exception ex)
                                             {
-                                                Log.Error(ex, "账号用量已经用完, 禁用账号异常 {@0}", _discordAccount.ChannelId);
+                                                Log.Error(ex, "账号用量已经用完, 禁用账号异常 {@0}", Account.ChannelId);
                                             }
                                         });
 
@@ -473,7 +766,7 @@ namespace Midjourney.Infrastructure
                                         || title == "Subscription required")
                                     {
                                         // 你的处理逻辑
-                                        _logger.Warning($"账号 {_discordAccount.GetDisplay()} {title}, 自动禁用账号");
+                                        _logger.Warning($"账号 {Account.GetDisplay()} {title}, 自动禁用账号");
 
                                         var task = _discordInstance.FindRunningTask(c => c.MessageId == id).FirstOrDefault();
                                         if (task == null && !string.IsNullOrWhiteSpace(metaId))
@@ -494,16 +787,21 @@ namespace Midjourney.Infrastructure
                                                 Thread.Sleep(5 * 1000);
 
                                                 // 保存
-                                                _discordAccount.Enable = false;
-                                                _discordAccount.DisabledReason = title;
+                                                Account.Enable = false;
+                                                Account.DisabledReason = title;
 
-                                                DbHelper.AccountStore.Save(_discordAccount);
+                                                DbHelper.AccountStore.Save(Account);
 
+                                                _discordInstance?.ClearAccountCache(Account.Id);
                                                 _discordInstance?.Dispose();
+
+                                                // 发送邮件
+                                                EmailJob.Instance.EmailSend(_properties.Smtp, $"MJ账号禁用通知-{Account.ChannelId}",
+                                                    $"{Account.ChannelId}, {Account.DisabledReason}");
                                             }
                                             catch (Exception ex)
                                             {
-                                                Log.Error(ex, "{@0}, 禁用账号异常 {@1}", title, _discordAccount.ChannelId);
+                                                Log.Error(ex, "{@0}, 禁用账号异常 {@1}", title, Account.ChannelId);
                                             }
                                         });
 
@@ -557,7 +855,7 @@ namespace Midjourney.Infrastructure
                                                             task.MessageIds.Add(id);
                                                         }
 
-                                                        _logger.Warning($"未知消息: {title}, {item.GetProperty("description").GetString()}, {_discordAccount.ChannelId}");
+                                                        _logger.Warning($"未知消息: {title}, {item.GetProperty("description").GetString()}, {Account.ChannelId}");
                                                     }
                                                 }
                                             }
@@ -587,21 +885,22 @@ namespace Midjourney.Infrastructure
                                                 {
                                                     if (applicationId == Constants.NIJI_APPLICATION_ID)
                                                     {
-                                                        _discordAccount.SetProperty($"Niji {d.Key}", d.Value);
+                                                        Account.SetProperty($"Niji {d.Key}", d.Value);
                                                     }
                                                     else if (applicationId == Constants.MJ_APPLICATION_ID)
                                                     {
-                                                        _discordAccount.SetProperty(d.Key, d.Value);
+                                                        Account.SetProperty(d.Key, d.Value);
                                                     }
                                                 }
                                                 else
                                                 {
-                                                    _discordAccount.SetProperty(d.Key, d.Value);
+                                                    Account.SetProperty(d.Key, d.Value);
                                                 }
                                             }
 
                                             var db = DbHelper.AccountStore;
-                                            db.Update(_discordAccount);
+                                            db.Update(Account);
+                                            _discordInstance?.ClearAccountCache(Account.Id);
                                         }
                                     }
                                 }
@@ -617,17 +916,19 @@ namespace Midjourney.Infrastructure
                             {
                                 if (applicationId == Constants.NIJI_APPLICATION_ID)
                                 {
-                                    _discordAccount.NijiComponents = eventData.Components;
-                                    _discordAccount.NijiSettingsMessageId = id;
+                                    Account.NijiComponents = eventData.Components;
+                                    Account.NijiSettingsMessageId = id;
 
-                                    DbHelper.AccountStore.Update(_discordAccount);
+                                    DbHelper.AccountStore.Update(Account);
+                                    _discordInstance?.ClearAccountCache(Account.Id);
                                 }
                                 else if (applicationId == Constants.MJ_APPLICATION_ID)
                                 {
-                                    _discordAccount.Components = eventData.Components;
-                                    _discordAccount.SettingsMessageId = id;
+                                    Account.Components = eventData.Components;
+                                    Account.SettingsMessageId = id;
 
-                                    DbHelper.AccountStore.Update(_discordAccount);
+                                    DbHelper.AccountStore.Update(Account);
+                                    _discordInstance?.ClearAccountCache(Account.Id);
                                 }
                             }
 
@@ -650,7 +951,6 @@ namespace Midjourney.Infrastructure
                                 if (isPrivareChannel)
                                 {
                                     // 私信频道
-
                                 }
                                 else
                                 {
@@ -688,17 +988,31 @@ namespace Midjourney.Infrastructure
                     }
                 }
 
-                //Thread.Sleep(50);
+                // 如果消息类型是 CREATE
+                // 则再次处理消息确认事件，确保消息的高可用
+                if (messageType == MessageType.CREATE)
+                {
+                    Thread.Sleep(50);
 
-                //foreach (var messageHandler in _messageHandlers.OrderBy(h => h.Order()))
-                //{
-                //    if (data.TryGetProperty(Constants.MJ_MESSAGE_HANDLED, out JsonElement handled) && handled.GetBoolean())
-                //    {
-                //        return;
-                //    }
+                    var eventData = data.Deserialize<EventData>();
+                    if (eventData != null && eventData.ChannelId == Account.ChannelId)
+                    {
+                        foreach (var messageHandler in _userMessageHandlers.OrderBy(h => h.Order()))
+                        {
+                            // 处理过了
+                            if (eventData.GetProperty<bool?>(Constants.MJ_MESSAGE_HANDLED, default) == true)
+                            {
+                                return;
+                            }
 
-                //    //messageHandler.Handle(_discordInstance, messageType.Value, data);
-                //}
+                            // 消息加锁处理
+                            LocalLock.TryLock($"lock_{eventData.Id}", TimeSpan.FromSeconds(10), () =>
+                            {
+                                messageHandler.Handle(_discordInstance, messageType.Value, eventData);
+                            });
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {

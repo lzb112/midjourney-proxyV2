@@ -1,5 +1,8 @@
 ﻿using LiteDB;
 using Midjourney.Infrastructure.Domain;
+using Midjourney.Infrastructure.Dto;
+using Midjourney.Infrastructure.Util;
+using Serilog;
 using Swashbuckle.AspNetCore.Annotations;
 
 namespace Midjourney.Infrastructure
@@ -13,6 +16,11 @@ namespace Midjourney.Infrastructure
         public TaskInfo()
         {
         }
+
+        /// <summary>
+        /// 父级 ID
+        /// </summary>
+        public string ParentId { get; set; }
 
         /// <summary>
         /// bot 类型，mj(默认)或niji
@@ -153,7 +161,6 @@ namespace Midjourney.Infrastructure
             }
         }
 
-
         /// <summary>
         /// 任务的种子。
         /// </summary>
@@ -163,6 +170,26 @@ namespace Midjourney.Infrastructure
         /// Seed 消息 ID
         /// </summary>
         public string SeedMessageId { get; set; }
+
+        /// <summary>
+        /// 绘图任务客户的 IP 地址
+        /// </summary>
+        public string ClientIp { get; set; }
+
+        /// <summary>
+        /// 图片 ID / 图片 hash
+        /// </summary>
+        public string JobId { get; set; }
+
+        /// <summary>
+        /// 当前绘画客户端指定的速度模式
+        /// </summary>
+        public GenerationSpeedMode? Mode { get; set; }
+
+        /// <summary>
+        /// 账号过滤
+        /// </summary>
+        public AccountFilter AccountFilter { get; set; }
 
         /// <summary>
         /// 启动任务。
@@ -177,8 +204,84 @@ namespace Midjourney.Infrastructure
         /// <summary>
         /// 任务成功。
         /// </summary>
-        public void Success()
+        public void Success(string customCdn, bool downloadToLocal)
         {
+            try
+            {
+                // https://cdn.discordapp.com/attachments/1265095688782614602/1266300100989161584/03ytbus_LOGO_design_A_warrior_frog_Muscles_like_Popeye_Freehand_06857373-4fd9-403d-a5df-c2f27f9be269.png?ex=66a4a55e&is=66a353de&hm=c597e9d6d128c493df27a4d0ae41204655ab73f7e885878fc1876a8057a7999f&
+                // 将图片保存到本地，并替换 url，并且保持原 url和参数
+                // 默认保存根目录为 /wwwroot
+                // 保存图片
+                // 如果处理过了，则不再处理
+                if (downloadToLocal && !string.IsNullOrWhiteSpace(ImageUrl))
+                {
+                    // 本地锁
+                    LocalLock.TryLock(ImageUrl, TimeSpan.FromSeconds(10), () =>
+                    {
+                        // 如果不是以自定义 cdn 加速域名开头
+                        if (string.IsNullOrWhiteSpace(customCdn) || !ImageUrl.StartsWith(customCdn))
+                        {
+                            // 创建保存路径
+                            var uri = new Uri(ImageUrl);
+                            var localPath = uri.AbsolutePath.TrimStart('/');
+
+                            // 如果路径是 ephemeral-attachments 或 attachments 才处理
+                            if (localPath.StartsWith("ephemeral-attachments") || localPath.StartsWith("attachments"))
+                            {
+                                var savePath = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot", localPath);
+                                var directoryPath = Path.GetDirectoryName(savePath);
+
+                                if (!string.IsNullOrWhiteSpace(directoryPath))
+                                {
+                                    Directory.CreateDirectory(directoryPath);
+
+                                    // 下载图片并保存
+                                    using (HttpClient client = new HttpClient())
+                                    {
+                                        var response = client.GetAsync(ImageUrl).Result;
+                                        response.EnsureSuccessStatusCode();
+                                        var imageBytes = response.Content.ReadAsByteArrayAsync().Result;
+                                        File.WriteAllBytes(savePath, imageBytes);
+                                    }
+
+                                    // 替换 url
+                                    ImageUrl = $"{customCdn?.Trim()?.Trim('/')}/{localPath}{uri?.Query}";
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "保存图片失败 {@0}", ImageUrl);
+            }
+
+            // 调整图片 ACTION
+            // 如果是 show 时
+            if (Action == TaskAction.SHOW)
+            {
+                // 根据 buttons 调整
+                if (Buttons.Count > 0)
+                {
+                    // U1
+                    if (Buttons.Any(x => x.CustomId.Contains("MJ::JOB::upsample::1")))
+                    {
+                        Action = TaskAction.IMAGINE;
+                    }
+                    // 局部重绘说明是放大
+                    else if (Buttons.Any(x => x.CustomId.Contains("MJ::Inpaint::")))
+                    {
+                        Action = TaskAction.UPSCALE;
+                    }
+                    // MJ::Job::PicReader
+                    else if (Buttons.Any(x => x.CustomId.Contains("MJ::Job::PicReader")))
+                    {
+                        Action = TaskAction.DESCRIBE;
+                    }
+                }
+            }
+
             FinishTime = DateTimeOffset.Now.ToUnixTimeMilliseconds();
             Status = TaskStatus.SUCCESS;
             Progress = "100%";

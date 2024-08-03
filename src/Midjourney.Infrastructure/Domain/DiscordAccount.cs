@@ -1,9 +1,6 @@
 ﻿using LiteDB;
 using Midjourney.Infrastructure.Dto;
-using Newtonsoft.Json;
 using System.ComponentModel.DataAnnotations;
-using System.Reactive;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace Midjourney.Infrastructure.Domain
@@ -15,7 +12,9 @@ namespace Midjourney.Infrastructure.Domain
     {
         public DiscordAccount()
         {
+
         }
+
         /// <summary>
         /// 频道ID  = ID
         /// </summary>
@@ -64,15 +63,40 @@ namespace Midjourney.Infrastructure.Domain
         public bool Enable { get; set; } = true;
 
         /// <summary>
+        /// 是否锁定（暂时锁定，可能触发了人机验证）
+        /// </summary>
+        public bool Lock { get; set; }
+
+        /// <summary>
         /// 禁用原因
         /// </summary>
         public string DisabledReason { get; set; }
+
+        /// <summary>
+        /// 真人验证 hash url 创建时间
+        /// </summary>
+        public DateTime? CfHashCreated { get; set; }
+
+        /// <summary>
+        /// 真人验证 hash Url
+        /// </summary>
+        public string CfHashUrl { get; set; }
+
+        /// <summary>
+        /// 真人验证 Url
+        /// </summary>
+        public string CfUrl { get; set; }
 
         /// <summary>
         /// 并发数。
         /// </summary>
         [Display(Name = "并发数")]
         public int CoreSize { get; set; } = 3;
+
+        /// <summary>
+        /// 任务执行间隔时间（秒，默认：1.2s）。
+        /// </summary>
+        public decimal Interval { get; set; } = 1.2m;
 
         /// <summary>
         /// 等待队列长度。
@@ -98,9 +122,29 @@ namespace Midjourney.Infrastructure.Domain
         public string Remark { get; set; }
 
         /// <summary>
+        /// 赞助商（富文本）
+        /// </summary>
+        public string Sponsor { get; set; }
+
+        /// <summary>
+        /// 添加时间
+        /// </summary>
+        public DateTime DateCreated { get; set; } = DateTime.Now;
+
+        /// <summary>
         /// 权重
         /// </summary>
         public int Weight { get; set; }
+
+        /// <summary>
+        /// 工作时间
+        /// </summary>
+        public string WorkTime { get; set; }
+
+        /// <summary>
+        /// 排序
+        /// </summary>
+        public int Sort { get; set; }
 
         /// <summary>
         /// Remix 自动提交
@@ -112,6 +156,11 @@ namespace Midjourney.Infrastructure.Domain
         /// </summary>
         [Display(Name = "生成速度模式 fast | relax | turbo")]
         public GenerationSpeedMode? Mode { get; set; }
+
+        /// <summary>
+        /// 允许速度模式（如果出现不允许的速度模式，将会自动清除关键词）
+        /// </summary>
+        public List<GenerationSpeedMode> AllowModes { get; set; } = new List<GenerationSpeedMode>();
 
         /// <summary>
         /// MJ 组件列表。
@@ -166,6 +215,12 @@ namespace Midjourney.Infrastructure.Domain
             }).Where(c => c != null && !string.IsNullOrWhiteSpace(c.CustomId)).ToList();
 
         /// <summary>
+        /// MJ 是否开启 remix mode
+        /// </summary>
+        [BsonIgnore]
+        public bool MjRemixOn => Buttons.Any(x => x.Label == "Remix mode" && x.Style == 3);
+
+        /// <summary>
         /// Niji 按钮
         /// </summary>
         [BsonIgnore]
@@ -181,6 +236,12 @@ namespace Midjourney.Infrastructure.Domain
                     Type = (int?)c.Type ?? 0,
                 };
             }).Where(c => c != null && !string.IsNullOrWhiteSpace(c.CustomId)).ToList();
+
+        /// <summary>
+        /// Niji 是否开启 remix mode
+        /// </summary>
+        [BsonIgnore]
+        public bool NijiRemixOn => NijiButtons.Any(x => x.Label == "Remix mode" && x.Style == 3);
 
         /// <summary>
         /// Mj 下拉框
